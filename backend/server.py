@@ -26,9 +26,9 @@ from reportlab.lib.enums import TA_CENTER
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-client_db = AsyncIOMotorClient(os.environ['MONGO_URL'])
-db = client_db[os.environ['DB_NAME']]
-anthropic_client = anthropic.Anthropic(api_key=os.environ.get('ANTHROPIC_API_KEY'))
+client_db = AsyncIOMotorClient(os.environ.get('MONGO_URL', ''))
+db = client_db[os.environ.get('DB_NAME', '')]
+anthropic_client = anthropic.Anthropic(api_key=os.environ.get('ANTHROPIC_API_KEY', ''))
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
