@@ -4,7 +4,7 @@ import axios from 'axios';
 import { Upload, Music, Activity, Volume2, Headphones, Lightbulb, FileAudio, AlertCircle, Download, Info, BarChart3, AudioWaveform, MessageSquare, Bot, BookOpen, Send } from 'lucide-react';
 import Spectrogram3D from './components/Spectrogram3D';
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
+const BACKEND_URL = import.meta.env.VITE_API_URL;
 const API = `${BACKEND_URL}/api`;
 
 const GLOSSARY = {
