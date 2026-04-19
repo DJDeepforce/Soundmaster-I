@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 import numpy as np
 import tempfile
 import io
+import time
+import asyncio
 import anthropic
 import librosa
 import pyloudnorm as pyln
@@ -138,9 +140,11 @@ def analyze_loudness(y, sr):
     except Exception:
         lufs = rms_db - 0.691
 
-    # True Peak
+    # True Peak — cap to 30s before 4x upsample to avoid OOM on free-tier servers
     try:
-        y_up = librosa.resample(y, orig_sr=sr, target_sr=sr*4)
+        max_samples = sr * 30
+        y_clip = y[:max_samples] if len(y) > max_samples else y
+        y_up = librosa.resample(y_clip, orig_sr=sr, target_sr=sr * 4)
         true_peak_db = 20 * np.log10(np.max(np.abs(y_up)) + 1e-10)
     except Exception:
         true_peak_db = peak_db
@@ -218,14 +222,16 @@ Largeur: {stereo.width} | Balance: {stereo.balance}
 Références: Spotify -14 LUFS | Apple Music -16 LUFS | YouTube -14 LUFS | Club -6/-8 LUFS
 """
     try:
-        msg = anthropic_client.messages.create(
-            model="claude-sonnet-4-20250514", max_tokens=1024,
-            system="""Ingénieur du son professionnel expert mixage/mastering.
+        def _call_claude():
+            return anthropic_client.messages.create(
+                model="claude-sonnet-4-20250514", max_tokens=1024,
+                system="""Ingénieur du son professionnel expert mixage/mastering.
 5-6 recommandations concrètes en français, une par ligne.
 Mentionne les standards LUFS des plateformes si pertinent.
 Sois précis et technique. Ne numérote pas.""",
-            messages=[{"role":"user","content":f"Recommandations pour ce mix:\n{summary}"}]
-        )
+                messages=[{"role": "user", "content": f"Recommandations pour ce mix:\n{summary}"}]
+            )
+        msg = await asyncio.to_thread(_call_claude)
         recs = [r.strip() for r in msg.content[0].text.strip().split('\n') if r.strip() and len(r.strip()) > 10]
         return recs[:6]
     except Exception as e:
@@ -264,18 +270,42 @@ async def analyze_audio(file: UploadFile = File(...)):
             tmp.write(content)
             tmp_path = tmp.name
         try:
-            y, sr = librosa.load(tmp_path, sr=None, mono=False)
+            t0 = time.time()
+            logger.info(f"[analyze] loading file: {file.filename}")
+            y, sr = await asyncio.to_thread(librosa.load, tmp_path, sr=None, mono=False)
+            logger.info(f"[analyze] load done in {time.time()-t0:.2f}s")
+
             if y.ndim == 1:
                 duration, channels, y_mono = len(y)/sr, 1, y
             else:
                 duration, channels, y_mono = y.shape[1]/sr, y.shape[0], librosa.to_mono(y)
 
-            freq = analyze_frequency_bands(y_mono, sr)
-            loudness = analyze_loudness(y_mono, sr)
-            stereo = analyze_stereo(y, sr)
-            spec3d = generate_3d_spectrogram(y_mono, sr)
+            t1 = time.time()
+            logger.info(f"[analyze] frequency bands start")
+            freq = await asyncio.to_thread(analyze_frequency_bands, y_mono, sr)
+            logger.info(f"[analyze] frequency bands done in {time.time()-t1:.2f}s")
+
+            t2 = time.time()
+            logger.info(f"[analyze] loudness start")
+            loudness = await asyncio.to_thread(analyze_loudness, y_mono, sr)
+            logger.info(f"[analyze] loudness done in {time.time()-t2:.2f}s")
+
+            t3 = time.time()
+            logger.info(f"[analyze] stereo start")
+            stereo = await asyncio.to_thread(analyze_stereo, y, sr)
+            logger.info(f"[analyze] stereo done in {time.time()-t3:.2f}s")
+
+            t4 = time.time()
+            logger.info(f"[analyze] spectrogram start")
+            spec3d = await asyncio.to_thread(generate_3d_spectrogram, y_mono, sr)
+            logger.info(f"[analyze] spectrogram done in {time.time()-t4:.2f}s")
+
             score = calculate_score(freq, loudness, stereo)
+
+            t5 = time.time()
+            logger.info(f"[analyze] Claude recommendations start")
             recs = await get_recommendations(freq, loudness, stereo, file.filename)
+            logger.info(f"[analyze] Claude done in {time.time()-t5:.2f}s")
 
             aid = str(uuid.uuid4())
             result = AnalysisResult(
