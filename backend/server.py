@@ -9,6 +9,7 @@ from pathlib import Path
 from pydantic import BaseModel
 from typing import List, Dict, Optional
 import uuid
+import json
 from datetime import datetime, timezone
 import numpy as np
 import tempfile
@@ -257,59 +258,159 @@ Sois précis et technique. Ne numérote pas.""",
 async def root():
     return {"message": "SoundMaster API v2 — Powered by Claude"}
 
+MAX_DURATION_S = 60   # truncate audio to this before any processing
+ANALYZE_TIMEOUT = 90  # hard timeout for the full pipeline (seconds)
+
+
+def _truncate(y, sr, max_seconds=MAX_DURATION_S):
+    """Truncate audio array to at most max_seconds."""
+    max_samples = int(sr * max_seconds)
+    if y.ndim == 1:
+        return y[:max_samples] if len(y) > max_samples else y
+    else:
+        return y[:, :max_samples] if y.shape[1] > max_samples else y
+
+
+async def _run_pipeline(tmp_path: str, filename: str):
+    """Full analysis pipeline — called by both /analyze and /analyze-stream."""
+    t0 = time.time()
+    logger.info(f"[analyze] loading: {filename}")
+    y, sr = await asyncio.to_thread(librosa.load, tmp_path, sr=None, mono=False)
+    logger.info(f"[analyze] load done in {time.time()-t0:.2f}s — shape {y.shape}")
+
+    # Truncate to MAX_DURATION_S
+    y = _truncate(y, sr)
+
+    if y.ndim == 1:
+        duration, channels, y_mono = len(y) / sr, 1, y
+    else:
+        duration, channels, y_mono = y.shape[1] / sr, y.shape[0], librosa.to_mono(y)
+    logger.info(f"[analyze] duration after truncation: {duration:.1f}s")
+
+    t1 = time.time()
+    freq = await asyncio.to_thread(analyze_frequency_bands, y_mono, sr)
+    logger.info(f"[analyze] freq bands {time.time()-t1:.2f}s")
+
+    t2 = time.time()
+    loudness = await asyncio.to_thread(analyze_loudness, y_mono, sr)
+    logger.info(f"[analyze] loudness {time.time()-t2:.2f}s")
+
+    t3 = time.time()
+    stereo = await asyncio.to_thread(analyze_stereo, y, sr)
+    logger.info(f"[analyze] stereo {time.time()-t3:.2f}s")
+
+    t4 = time.time()
+    spec3d = await asyncio.to_thread(generate_3d_spectrogram, y_mono, sr)
+    logger.info(f"[analyze] spectrogram {time.time()-t4:.2f}s")
+
+    score = calculate_score(freq, loudness, stereo)
+
+    t5 = time.time()
+    recs = await get_recommendations(freq, loudness, stereo, filename)
+    logger.info(f"[analyze] claude {time.time()-t5:.2f}s — total {time.time()-t0:.2f}s")
+
+    aid = str(uuid.uuid4())
+    result = AnalysisResult(
+        id=aid, filename=filename, duration=round(duration, 2),
+        sample_rate=sr, channels=channels,
+        frequency_analysis={k: v.model_dump() for k, v in freq.items()},
+        loudness_analysis=loudness, stereo_analysis=stereo,
+        recommendations=recs, overall_score=score, status="completed", spectrogram_3d=spec3d
+    )
+    doc = result.model_dump()
+    doc['created_at'] = datetime.now(timezone.utc).isoformat()
+    await db.audio_analyses.insert_one(doc)
+    return result
+
+
 @api_router.post("/analyze", response_model=AnalysisResult)
 async def analyze_audio(file: UploadFile = File(...)):
     if not file.filename:
         raise HTTPException(400, "Nom de fichier manquant")
     fname = file.filename.lower()
     if not any(fname.endswith(f) for f in SUPPORTED_FORMATS):
-        raise HTTPException(400, f"Format non supporté. Acceptés: WAV, MP3, FLAC, AIFF, OGG")
+        raise HTTPException(400, "Format non supporté. Acceptés: WAV, MP3, FLAC, AIFF, OGG")
     try:
         content = await file.read()
         with tempfile.NamedTemporaryFile(suffix=Path(fname).suffix, delete=False) as tmp:
             tmp.write(content)
             tmp_path = tmp.name
         try:
+            result = await asyncio.wait_for(
+                _run_pipeline(tmp_path, file.filename),
+                timeout=ANALYZE_TIMEOUT
+            )
+            return result
+        except asyncio.TimeoutError:
+            logger.error(f"[analyze] timeout after {ANALYZE_TIMEOUT}s for {file.filename}")
+            raise HTTPException(504, f"Analyse trop longue (limite {ANALYZE_TIMEOUT}s). Essayez un fichier plus court.")
+        finally:
+            os.unlink(tmp_path)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Analysis error: {e}")
+        raise HTTPException(500, f"Erreur analyse: {str(e)}")
+
+
+@api_router.post("/analyze-stream")
+async def analyze_stream(file: UploadFile = File(...)):
+    """
+    SSE streaming version of /analyze.
+    Sends progress events as 'data: {...}\\n\\n' then the full result as the last event.
+
+    Frontend usage (replaces axios POST):
+        const res = await fetch(`${API}/analyze-stream`, { method: 'POST', body: formData });
+        const reader = res.body.getReader();
+        // parse SSE lines, update progress bar, parse final 'result' event
+    """
+    if not file.filename:
+        raise HTTPException(400, "Nom de fichier manquant")
+    fname = file.filename.lower()
+    if not any(fname.endswith(f) for f in SUPPORTED_FORMATS):
+        raise HTTPException(400, "Format non supporté. Acceptés: WAV, MP3, FLAC, AIFF, OGG")
+
+    content = await file.read()
+    filename = file.filename
+
+    async def generate():
+        def evt(step: str, progress: int, message: str = ""):
+            return f"data: {json.dumps({'step': step, 'progress': progress, 'message': message})}\n\n"
+
+        with tempfile.NamedTemporaryFile(suffix=Path(fname).suffix, delete=False) as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+
+        try:
+            yield evt("loading", 10, "Chargement du fichier…")
             t0 = time.time()
-            logger.info(f"[analyze] loading file: {file.filename}")
             y, sr = await asyncio.to_thread(librosa.load, tmp_path, sr=None, mono=False)
-            logger.info(f"[analyze] load done in {time.time()-t0:.2f}s")
-
+            y = _truncate(y, sr)
             if y.ndim == 1:
-                duration, channels, y_mono = len(y)/sr, 1, y
+                duration, channels, y_mono = len(y) / sr, 1, y
             else:
-                duration, channels, y_mono = y.shape[1]/sr, y.shape[0], librosa.to_mono(y)
+                duration, channels, y_mono = y.shape[1] / sr, y.shape[0], librosa.to_mono(y)
 
-            t1 = time.time()
-            logger.info(f"[analyze] frequency bands start")
+            yield evt("frequency", 30, "Analyse spectrale…")
             freq = await asyncio.to_thread(analyze_frequency_bands, y_mono, sr)
-            logger.info(f"[analyze] frequency bands done in {time.time()-t1:.2f}s")
 
-            t2 = time.time()
-            logger.info(f"[analyze] loudness start")
+            yield evt("loudness", 50, "Analyse de la loudness…")
             loudness = await asyncio.to_thread(analyze_loudness, y_mono, sr)
-            logger.info(f"[analyze] loudness done in {time.time()-t2:.2f}s")
 
-            t3 = time.time()
-            logger.info(f"[analyze] stereo start")
+            yield evt("stereo", 60, "Analyse stéréo…")
             stereo = await asyncio.to_thread(analyze_stereo, y, sr)
-            logger.info(f"[analyze] stereo done in {time.time()-t3:.2f}s")
 
-            t4 = time.time()
-            logger.info(f"[analyze] spectrogram start")
+            yield evt("spectrogram", 70, "Génération du spectrogramme 3D…")
             spec3d = await asyncio.to_thread(generate_3d_spectrogram, y_mono, sr)
-            logger.info(f"[analyze] spectrogram done in {time.time()-t4:.2f}s")
 
             score = calculate_score(freq, loudness, stereo)
 
-            t5 = time.time()
-            logger.info(f"[analyze] Claude recommendations start")
-            recs = await get_recommendations(freq, loudness, stereo, file.filename)
-            logger.info(f"[analyze] Claude done in {time.time()-t5:.2f}s")
+            yield evt("recommendations", 85, "Recommandations IA…")
+            recs = await get_recommendations(freq, loudness, stereo, filename)
 
             aid = str(uuid.uuid4())
             result = AnalysisResult(
-                id=aid, filename=file.filename, duration=round(duration,2),
+                id=aid, filename=filename, duration=round(duration, 2),
                 sample_rate=sr, channels=channels,
                 frequency_analysis={k: v.model_dump() for k, v in freq.items()},
                 loudness_analysis=loudness, stereo_analysis=stereo,
@@ -318,12 +419,20 @@ async def analyze_audio(file: UploadFile = File(...)):
             doc = result.model_dump()
             doc['created_at'] = datetime.now(timezone.utc).isoformat()
             await db.audio_analyses.insert_one(doc)
-            return result
+
+            logger.info(f"[analyze-stream] done in {time.time()-t0:.2f}s")
+            yield f"data: {json.dumps({'step': 'done', 'progress': 100, 'result': doc})}\n\n"
+        except Exception as e:
+            logger.error(f"[analyze-stream] error: {e}")
+            yield f"data: {json.dumps({'step': 'error', 'message': str(e)})}\n\n"
         finally:
             os.unlink(tmp_path)
-    except Exception as e:
-        logger.error(f"Analysis error: {e}")
-        raise HTTPException(500, f"Erreur analyse: {str(e)}")
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    )
 
 @api_router.get("/analyses", response_model=List[AnalysisResult])
 async def get_analyses():
