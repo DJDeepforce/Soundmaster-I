@@ -253,6 +253,8 @@ async def root():
 
 @api_router.post("/analyze", response_model=AnalysisResult)
 async def analyze_audio(file: UploadFile = File(...)):
+    if not file.filename:
+        raise HTTPException(400, "Nom de fichier manquant")
     fname = file.filename.lower()
     if not any(fname.endswith(f) for f in SUPPORTED_FORMATS):
         raise HTTPException(400, f"Format non supporté. Acceptés: WAV, MP3, FLAC, AIFF, OGG")
@@ -295,7 +297,11 @@ async def analyze_audio(file: UploadFile = File(...)):
 
 @api_router.get("/analyses", response_model=List[AnalysisResult])
 async def get_analyses():
-    return await db.audio_analyses.find({}, {"_id": 0}).to_list(100)
+    try:
+        return await db.audio_analyses.find({}, {"_id": 0}).to_list(100)
+    except Exception as e:
+        logger.error(f"get_analyses error: {e}")
+        raise HTTPException(500, "Erreur lors de la récupération des analyses")
 
 @api_router.post("/chat", response_model=ChatResponse)
 async def chat_with_ai(chat: ChatMessage):
@@ -324,7 +330,11 @@ Précis, technique mais accessible. En français. Hors sujet → redirige polime
 
 @api_router.get("/export-pdf/{analysis_id}")
 async def export_pdf(analysis_id: str):
-    analysis = await db.audio_analyses.find_one({"id": analysis_id}, {"_id": 0})
+    try:
+        analysis = await db.audio_analyses.find_one({"id": analysis_id}, {"_id": 0})
+    except Exception as e:
+        logger.error(f"export_pdf DB error: {e}")
+        raise HTTPException(500, "Erreur base de données")
     if not analysis:
         raise HTTPException(404, "Analyse non trouvée")
 
