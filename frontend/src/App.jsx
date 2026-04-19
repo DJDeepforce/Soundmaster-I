@@ -583,8 +583,7 @@ Headroom: ${analysisResult.loudness_analysis.headroom_db} dB | Dynamique: ${anal
     <div className="app" data-testid="soundmaster-app">
       <div className="content">
         <header className="header" data-testid="app-header">
-          <WaveformLogo />
-          <h1 className="title">SoundMaster</h1>
+          <img src="/logo.png" alt="SoundMaster" className="header-logo" />
           <p className="subtitle">Analyseur Audio Professionnel</p>
         </header>
 
@@ -652,7 +651,6 @@ Headroom: ${analysisResult.loudness_analysis.headroom_db} dB | Dynamique: ${anal
 
         {!analysisResult && !isAnalyzing && (
           <div className="empty-state" data-testid="empty-state">
-            <img src="/logo.png" alt="SoundMaster" className="empty-logo" />
             <p className="empty-text">
               Téléchargez un fichier audio pour obtenir une analyse professionnelle avec recommandations IA.
             </p>
