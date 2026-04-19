@@ -1,7 +1,19 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import './App.css';
-import { Upload, Music, Activity, Volume2, Headphones, Lightbulb, FileAudio, AlertCircle, Download, Info, BarChart3, AudioWaveform, MessageSquare, Bot, BookOpen, Send } from 'lucide-react';
+import { Upload, Activity, Volume2, Headphones, Lightbulb, FileAudio, AlertCircle, Download, Info, BarChart3, AudioWaveform, MessageSquare, Bot, BookOpen, Send } from 'lucide-react';
 import Spectrogram3D from './components/Spectrogram3D.jsx';
+
+const WaveformLogo = () => (
+  <svg width="48" height="48" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="SoundMaster logo">
+    <rect x="2" y="20" width="4" height="8" fill="#00FFE0"/>
+    <rect x="9" y="14" width="4" height="20" fill="#00FFE0"/>
+    <rect x="16" y="6" width="4" height="36" fill="#00FFE0"/>
+    <rect x="23" y="10" width="4" height="28" fill="#00FFE0" opacity="0.9"/>
+    <rect x="30" y="4" width="4" height="40" fill="#00FFE0"/>
+    <rect x="37" y="16" width="4" height="16" fill="#00FFE0"/>
+    <rect x="44" y="21" width="2" height="6" fill="#00FFE0"/>
+  </svg>
+);
 
 const BACKEND_URL = import.meta.env.VITE_API_URL;
 const API = `${BACKEND_URL}/api`;
@@ -202,13 +214,14 @@ Headroom: ${analysisResult.loudness_analysis.headroom_db} dB | Dynamique: ${anal
       // Envoie l'historique complet pour que Claude se souvienne de la conversation
       const history = newMessages.slice(0, -1).map(m => ({ role: m.role, content: m.content }));
 
-      const response = await axios.post(`${API}/chat`, {
-        message: userMessage,
-        context,
-        history,
+      const response = await fetch(`${API}/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: userMessage, context, history }),
       });
+      const data = await response.json();
 
-      setChatMessages([...newMessages, { role: 'assistant', content: response.data.response }]);
+      setChatMessages([...newMessages, { role: 'assistant', content: data.response }]);
     } catch (err) {
       setChatMessages([...newMessages, {
         role: 'assistant',
@@ -570,7 +583,7 @@ Headroom: ${analysisResult.loudness_analysis.headroom_db} dB | Dynamique: ${anal
     <div className="app" data-testid="soundmaster-app">
       <div className="content">
         <header className="header" data-testid="app-header">
-          <Music size={48} className="header-icon" />
+          <WaveformLogo />
           <h1 className="title">SoundMaster</h1>
           <p className="subtitle">Analyseur Audio Professionnel</p>
         </header>
