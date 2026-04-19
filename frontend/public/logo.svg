@@ -1,0 +1,16 @@
+<svg width="320" height="120" viewBox="0 0 320 120" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Waveform bars -->
+  <rect x="0"  y="52" width="8" height="16" rx="0" fill="#00FFE0" opacity="0.5"/>
+  <rect x="12" y="40" width="8" height="40" rx="0" fill="#00FFE0" opacity="0.65"/>
+  <rect x="24" y="24" width="8" height="72" rx="0" fill="#00FFE0" opacity="0.8"/>
+  <rect x="36" y="32" width="8" height="56" rx="0" fill="#00FFE0"/>
+  <rect x="48" y="8"  width="8" height="104" rx="0" fill="#00FFE0"/>
+  <rect x="60" y="18" width="8" height="84" rx="0" fill="#00FFE0"/>
+  <rect x="72" y="36" width="8" height="48" rx="0" fill="#00FFE0" opacity="0.8"/>
+  <rect x="84" y="28" width="8" height="64" rx="0" fill="#00FFE0"/>
+  <rect x="96" y="44" width="8" height="32" rx="0" fill="#00FFE0" opacity="0.65"/>
+  <rect x="108" y="54" width="8" height="12" rx="0" fill="#00FFE0" opacity="0.4"/>
+  <!-- Wordmark -->
+  <text x="128" y="72" font-family="'Space Grotesk', 'Arial Black', sans-serif" font-size="38" font-weight="800" letter-spacing="-2" fill="#FFFFFF">SOUND</text>
+  <text x="128" y="108" font-family="'Space Grotesk', 'Arial Black', sans-serif" font-size="38" font-weight="800" letter-spacing="-2" fill="#00FFE0">MASTER</text>
+</svg>

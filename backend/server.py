@@ -461,13 +461,21 @@ Précis, technique mais accessible. En français. Hors sujet → redirige polime
                     messages.append({"role": m['role'], "content": m['content']})
         messages.append({"role": "user", "content": chat.message})
 
-        msg = anthropic_client.messages.create(
-            model="claude-sonnet-4-20250514", max_tokens=1024,
-            system=system, messages=messages
-        )
+        def _call():
+            return anthropic_client.messages.create(
+                model="claude-sonnet-4-20250514", max_tokens=1024,
+                system=system, messages=messages
+            )
+        msg = await asyncio.to_thread(_call)
         return ChatResponse(response=msg.content[0].text.strip())
+    except anthropic.APIStatusError as e:
+        logger.error(f"Chat Anthropic API error {e.status_code}: {e.message}")
+        raise HTTPException(502, f"Erreur API IA ({e.status_code}): {e.message}")
+    except anthropic.APIConnectionError as e:
+        logger.error(f"Chat Anthropic connection error: {e}")
+        raise HTTPException(502, "Impossible de joindre l'API IA. Réessayez.")
     except Exception as e:
-        logger.error(f"Chat error: {e}")
+        logger.error(f"Chat error: {e}", exc_info=True)
         raise HTTPException(500, f"Erreur chat: {str(e)}")
 
 @api_router.get("/export-pdf/{analysis_id}")
