@@ -652,7 +652,7 @@ Headroom: ${analysisResult.loudness_analysis.headroom_db} dB | Dynamique: ${anal
 
         {!analysisResult && !isAnalyzing && (
           <div className="empty-state" data-testid="empty-state">
-            <img src="/logo.svg" alt="SoundMaster" className="empty-logo" />
+            <img src="/logo.png" alt="SoundMaster" className="empty-logo" />
             <p className="empty-text">
               Téléchargez un fichier audio pour obtenir une analyse professionnelle avec recommandations IA.
             </p>
