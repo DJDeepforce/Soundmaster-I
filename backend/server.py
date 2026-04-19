@@ -416,11 +416,12 @@ async def analyze_stream(file: UploadFile = File(...)):
                 loudness_analysis=loudness, stereo_analysis=stereo,
                 recommendations=recs, overall_score=score, status="completed", spectrogram_3d=spec3d
             )
-            # Serialize BEFORE insert_one — MongoDB mutates the dict in-place
-            # adding _id: ObjectId(...) which is not JSON-serializable.
             result_dict = result.model_dump()
             result_dict['created_at'] = datetime.now(timezone.utc).isoformat()
-            await db.audio_analyses.insert_one(dict(result_dict))  # copy → _id added to copy only
+            try:
+                await db.audio_analyses.insert_one(dict(result_dict))
+            except Exception as db_err:
+                logger.error(f"[analyze-stream] DB insert failed (non-fatal): {db_err}")
 
             logger.info(f"[analyze-stream] done in {time.time()-t0:.2f}s")
             yield f"data: {json.dumps({'step': 'done', 'progress': 100, 'result': result_dict})}\n\n"
