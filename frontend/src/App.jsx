@@ -1,6 +1,5 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import './App.css';
-import axios from 'axios';
 import { Upload, Music, Activity, Volume2, Headphones, Lightbulb, FileAudio, AlertCircle, Download, Info, BarChart3, AudioWaveform, MessageSquare, Bot, BookOpen, Send } from 'lucide-react';
 import Spectrogram3D from './components/Spectrogram3D.jsx';
 
@@ -132,24 +131,52 @@ function App() {
     try {
       const formData = new FormData();
       formData.append('file', file);
-      setUploadProgress(10);
+      setUploadProgress(5);
 
-      const response = await axios.post(`${API}/analyze`, formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-        onUploadProgress: (progressEvent) => {
-          if (progressEvent.total) {
-            const progress = Math.round((progressEvent.loaded * 60) / progressEvent.total) + 10;
-            setUploadProgress(Math.min(progress, 70));
-          }
-        },
-        timeout: 120000,
+      const response = await fetch(`${API}/analyze-stream`, {
+        method: 'POST',
+        body: formData,
       });
 
-      setUploadProgress(100);
-      setAnalysisResult(response.data);
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.detail || `Erreur serveur ${response.status}`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop(); // keep incomplete last line
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const payload = JSON.parse(line.slice(6));
+            if (payload.step === 'error') {
+              throw new Error(payload.message || 'Erreur analyse');
+            }
+            if (typeof payload.progress === 'number') {
+              setUploadProgress(payload.progress);
+            }
+            if (payload.step === 'done' && payload.result) {
+              setAnalysisResult(payload.result);
+            }
+          } catch (parseErr) {
+            if (parseErr.message !== 'Erreur analyse') console.warn('SSE parse:', parseErr);
+            else throw parseErr;
+          }
+        }
+      }
     } catch (err) {
       console.error('Analysis error:', err);
-      setError(err.response?.data?.detail || err.message || 'Erreur inconnue');
+      setError(err.message || 'Erreur inconnue');
     } finally {
       setIsAnalyzing(false);
     }
