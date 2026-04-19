@@ -30,9 +30,11 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-.app { min-height: 100vh; background: var(--bg); }
+.app { min-height: 100vh; background: var(--bg); position: relative; z-index: 1; }
 
 .content {
+  position: relative;
+  z-index: 1;
   max-width: 640px;
   margin: 0 auto;
   padding: 48px 20px 80px;
@@ -832,27 +834,24 @@ body {
 
 /* ── Empty State ───────────────────────────────────────────────────────────── */
 .empty-state {
-  position: relative;
   text-align: center;
   padding: 60px 32px 80px;
   margin-top: 24px;
 }
 
-.empty-bg-logo {
-  position: absolute;
+.bg-logo {
+  position: fixed;
   top: 0;
   left: 0;
-  width: 100%;
+  width: 100vw;
   height: 100vh;
-  object-fit: contain;
-  opacity: 0.08;
+  object-fit: cover;
+  opacity: 0.12;
   z-index: 0;
   pointer-events: none;
 }
 
 .empty-text {
-  position: relative;
-  z-index: 1;
   font-size: 12px;
   letter-spacing: 0.5px;
   color: var(--muted);
