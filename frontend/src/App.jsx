@@ -17,6 +17,7 @@ const WaveformLogo = () => (
 
 const BACKEND_URL = import.meta.env.VITE_API_URL;
 const API = `${BACKEND_URL}/api`;
+const TIER_LIMITS = { free: 2, starter: 15, pro: 50 };
 
 const GLOSSARY = {
   composition: {
@@ -117,10 +118,51 @@ function App() {
   const chatEndRef = useRef(null);
 
   const [selectedCategory, setSelectedCategory] = useState('composition');
+  const [token, setToken] = useState(() => localStorage.getItem('sm_token'));
+  const [currentUser, setCurrentUser] = useState(null);
+  const [authMode, setAuthMode] = useState('login');
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authError, setAuthError] = useState(null);
+  const [authLoading, setAuthLoading] = useState(false);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatMessages]);
+
+  const logout = useCallback(() => {
+    localStorage.removeItem('sm_token');
+    setToken(null); setCurrentUser(null);
+    setAnalysisResult(null); setSelectedFile(null);
+  }, []);
+
+  const handleAuth = useCallback(async (e) => {
+    e.preventDefault();
+    setAuthLoading(true); setAuthError(null);
+    try {
+      const res = await fetch(`${API}/${authMode}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: authEmail, password: authPassword }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Erreur');
+      localStorage.setItem('sm_token', data.access_token);
+      setToken(data.access_token);
+    } catch (err) {
+      setAuthError(err.message);
+    } finally {
+      setAuthLoading(false);
+    }
+  }, [authMode, authEmail, authPassword]);
+
+  useEffect(() => {
+    if (!token) return;
+    fetch(`${API}/me`, { headers: { 'Authorization': `Bearer ${token}` } })
+      .then(r => r.ok ? r.json() : null)
+      .then(u => { if (u) setCurrentUser(u); else logout(); })
+      .catch(() => logout());
+  }, [token, logout]);
 
   const handleFileSelect = useCallback(async (event) => {
     const file = event.target.files[0];
@@ -148,7 +190,9 @@ function App() {
       const response = await fetch(`${API}/analyze-stream`, {
         method: 'POST',
         body: formData,
+        headers: { 'Authorization': `Bearer ${token}` },
       });
+      if (response.status === 401) { logout(); return; }
 
       if (!response.ok) {
         const err = await response.json().catch(() => ({}));
@@ -216,7 +260,7 @@ Headroom: ${analysisResult.loudness_analysis.headroom_db} dB | Dynamique: ${anal
 
       const response = await fetch(`${API}/chat`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
         body: JSON.stringify({ message: userMessage, context, history }),
       });
       const data = await response.json();
@@ -263,11 +307,17 @@ Headroom: ${analysisResult.loudness_analysis.headroom_db} dB | Dynamique: ${anal
     return '#FFC107';
   };
 
-  const handleExportPDF = useCallback(() => {
-    if (analysisResult?.id) {
-      window.open(`${API}/export-pdf/${analysisResult.id}`, '_blank');
-    }
-  }, [analysisResult]);
+  const handleExportPDF = useCallback(async () => {
+    if (!analysisResult?.id) return;
+    const res = await fetch(`${API}/export-pdf/${analysisResult.id}`,
+      { headers: { 'Authorization': `Bearer ${token}` } });
+    if (!res.ok) return;
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `SoundMaster_${analysisResult.filename}.pdf`;
+    a.click(); URL.revokeObjectURL(url);
+  }, [analysisResult, token]);
 
   const bandLabels = {
     'sub_bass': 'Sub Bass', 'bass': 'Bass', 'low_mids': 'Low Mids',
@@ -579,12 +629,48 @@ Headroom: ${analysisResult.loudness_analysis.headroom_db} dB | Dynamique: ${anal
     </div>
   );
 
+  if (!token) {
+    return (
+      <div className="app">
+        <img src="/logo.png" alt="" className="bg-logo" aria-hidden="true" />
+        <div className="content">
+          <header className="header"><p className="subtitle">Analyseur Audio Professionnel</p></header>
+          <div className="auth-card">
+            <h2 className="auth-title">{authMode === 'login' ? 'Connexion' : 'Créer un compte'}</h2>
+            {authError && <div className="error-message"><AlertCircle size={16}/><span>{authError}</span></div>}
+            <form onSubmit={handleAuth} className="auth-form">
+              <input type="email" value={authEmail} onChange={e => setAuthEmail(e.target.value)}
+                placeholder="Email" required className="auth-input" />
+              <input type="password" value={authPassword} onChange={e => setAuthPassword(e.target.value)}
+                placeholder="Mot de passe" required className="auth-input" />
+              <button type="submit" className="auth-submit" disabled={authLoading}>
+                {authLoading ? 'Chargement...' : authMode === 'login' ? 'Se connecter' : 'Créer le compte'}
+              </button>
+            </form>
+            <button className="auth-switch"
+              onClick={() => { setAuthMode(m => m === 'login' ? 'register' : 'login'); setAuthError(null); }}>
+              {authMode === 'login' ? "Pas encore de compte ? S'inscrire" : "Déjà un compte ? Se connecter"}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="app" data-testid="soundmaster-app">
       <img src="/logo.png" alt="" className="bg-logo" aria-hidden="true" />
       <div className="content">
         <header className="header" data-testid="app-header">
           <p className="subtitle">Analyseur Audio Professionnel</p>
+          {currentUser && (
+            <div className="user-bar">
+              <span className="user-email">{currentUser.email}</span>
+              <span className={`user-tier tier-${currentUser.tier}`}>{currentUser.tier}</span>
+              <span className="user-quota">{currentUser.analyses_used}/{TIER_LIMITS[currentUser.tier] ?? 2} analyses</span>
+              <button className="logout-btn" onClick={logout}>Déconnexion</button>
+            </div>
+          )}
         </header>
 
         <label className={`upload-button ${isAnalyzing ? 'disabled' : ''}`} data-testid="upload-button">
