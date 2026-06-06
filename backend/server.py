@@ -1,5 +1,6 @@
-from fastapi import FastAPI, APIRouter, UploadFile, File, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, APIRouter, UploadFile, File, HTTPException, Depends, Request
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.security import OAuth2PasswordBearer
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -10,7 +11,7 @@ from pydantic import BaseModel
 from typing import List, Dict, Optional
 import uuid
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import numpy as np
 import tempfile
 import io
@@ -25,6 +26,12 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.enums import TA_CENTER
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+import filetype
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -34,11 +41,26 @@ db = client_db[os.environ.get('DB_NAME', '')]
 anthropic_client = anthropic.Anthropic(api_key=os.environ.get('ANTHROPIC_API_KEY', ''))
 
 app = FastAPI()
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
 api_router = APIRouter(prefix="/api")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 SUPPORTED_FORMATS = ('.wav', '.mp3', '.flac', '.aiff', '.aif', '.ogg')
+MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
+SECRET_KEY = os.environ.get('JWT_SECRET_KEY', 'changeme-please-set-in-env')
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 jours
+TIER_LIMITS = {"free": 2, "starter": 15, "pro": 50}
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login")
+limiter = Limiter(key_func=get_remote_address)
+
+def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return JSONResponse(status_code=429,
+        content={"detail": "Trop de requêtes. Réessayez dans 1 minute."})
 
 # ==================== MODELS ====================
 
@@ -88,6 +110,59 @@ class ChatMessage(BaseModel):
 
 class ChatResponse(BaseModel):
     response: str
+
+class UserCreate(BaseModel):
+    email: str
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class UserResponse(BaseModel):
+    user_id: str
+    email: str
+    tier: str
+    analyses_used: int
+
+# ==================== AUTH ====================
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
+
+def create_access_token(data: dict) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    return jwt.encode({**data, "exp": expire}, SECRET_KEY, algorithm=ALGORITHM)
+
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        if not user_id:
+            raise HTTPException(401, "Token invalide")
+    except JWTError:
+        raise HTTPException(401, "Token invalide ou expiré")
+    user = await db.users.find_one({"user_id": user_id}, {"_id": 0, "password": 0})
+    if not user:
+        raise HTTPException(401, "Utilisateur introuvable")
+    # Reset mensuel du quota
+    reset_at = user.get("analyses_reset_at")
+    if not reset_at or (datetime.now(timezone.utc) - datetime.fromisoformat(reset_at)) > timedelta(days=30):
+        await db.users.update_one(
+            {"user_id": user_id},
+            {"$set": {"analyses_used": 0, "analyses_reset_at": datetime.now(timezone.utc).isoformat()}}
+        )
+        user["analyses_used"] = 0
+    return user
+
+@app.on_event("startup")
+async def setup_indexes():
+    await db.users.create_index("email", unique=True)
+    await db.audio_analyses.create_index("user_id")
+    await db.audio_analyses.create_index([("created_at", -1)])
 
 # ==================== AUDIO FUNCTIONS ====================
 
@@ -205,7 +280,23 @@ def calculate_score(freq, loudness, stereo):
         if abs(stereo.balance) > 0.2: score -= 5
     return max(0, min(100, score))
 
-async def get_recommendations(freq, loudness, stereo, filename):
+async def get_recommendations(freq, loudness, stereo, filename, tier: str = "free"):
+    # Tier free : recommandations statiques, pas d'appel Claude
+    if tier == "free":
+        recs = []
+        if loudness.true_peak_db > 0:
+            recs.append(f"True Peak à {loudness.true_peak_db} dBTP — clipping détecté. Baissez le master et relimitez.")
+        if loudness.headroom_db < 1:
+            recs.append("Headroom insuffisant. Réduisez le gain master de 2-3 dB.")
+        if loudness.dynamic_range_db < 6:
+            recs.append("Mix sur-compressé. Réduisez le ratio de compression sur le bus master.")
+        if freq['bass'].energy_db > freq['mids'].energy_db + 6:
+            recs.append("Basses trop présentes. Cut EQ vers 200-300Hz.")
+        if stereo.phase_issues:
+            recs.append("Problème de phase stéréo. Vérifiez la polarité de vos pistes.")
+        if not recs:
+            recs.append("Mix équilibré. Passez au plan Starter pour des recommandations IA détaillées.")
+        return recs
     summary = f"""
 Fichier: {filename}
 LUFS intégré: {loudness.lufs_integrated} LUFS | True Peak: {loudness.true_peak_db} dBTP
@@ -225,7 +316,7 @@ Références: Spotify -14 LUFS | Apple Music -16 LUFS | YouTube -14 LUFS | Club 
     try:
         def _call_claude():
             return anthropic_client.messages.create(
-                model="claude-sonnet-4-20250514", max_tokens=1024,
+                model="claude-haiku-4-5-20251001", max_tokens=1024,
                 system="""Ingénieur du son professionnel expert mixage/mastering.
 5-6 recommandations concrètes en français, une par ligne.
 Mentionne les standards LUFS des plateformes si pertinent.
@@ -258,6 +349,31 @@ Sois précis et technique. Ne numérote pas.""",
 async def root():
     return {"message": "SoundMaster API v2 — Powered by Claude"}
 
+@api_router.post("/register", response_model=Token)
+async def register(user: UserCreate):
+    if await db.users.find_one({"email": user.email}):
+        raise HTTPException(400, "Email déjà utilisé")
+    user_id = str(uuid.uuid4())
+    await db.users.insert_one({
+        "user_id": user_id, "email": user.email,
+        "password": hash_password(user.password),
+        "tier": "free", "analyses_used": 0,
+        "analyses_reset_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat()
+    })
+    return {"access_token": create_access_token({"sub": user_id}), "token_type": "bearer"}
+
+@api_router.post("/login", response_model=Token)
+async def login(user: UserCreate):
+    db_user = await db.users.find_one({"email": user.email})
+    if not db_user or not verify_password(user.password, db_user["password"]):
+        raise HTTPException(401, "Email ou mot de passe incorrect")
+    return {"access_token": create_access_token({"sub": db_user["user_id"]}), "token_type": "bearer"}
+
+@api_router.get("/me", response_model=UserResponse)
+async def me(current_user: dict = Depends(get_current_user)):
+    return current_user
+
 MAX_DURATION_S = 60   # truncate audio to this before any processing
 ANALYZE_TIMEOUT = 90  # hard timeout for the full pipeline (seconds)
 
@@ -271,7 +387,7 @@ def _truncate(y, sr, max_seconds=MAX_DURATION_S):
         return y[:, :max_samples] if y.shape[1] > max_samples else y
 
 
-async def _run_pipeline(tmp_path: str, filename: str):
+async def _run_pipeline(tmp_path: str, filename: str, tier: str = "free"):
     """Full analysis pipeline — called by both /analyze and /analyze-stream."""
     t0 = time.time()
     logger.info(f"[analyze] loading: {filename}")
@@ -306,7 +422,7 @@ async def _run_pipeline(tmp_path: str, filename: str):
     score = calculate_score(freq, loudness, stereo)
 
     t5 = time.time()
-    recs = await get_recommendations(freq, loudness, stereo, filename)
+    recs = await get_recommendations(freq, loudness, stereo, filename, tier=tier)
     logger.info(f"[analyze] claude {time.time()-t5:.2f}s — total {time.time()-t0:.2f}s")
 
     aid = str(uuid.uuid4())
@@ -324,21 +440,37 @@ async def _run_pipeline(tmp_path: str, filename: str):
 
 
 @api_router.post("/analyze", response_model=AnalysisResult)
-async def analyze_audio(file: UploadFile = File(...)):
+@limiter.limit("5/minute")
+async def analyze_audio(request: Request, file: UploadFile = File(...),
+                         current_user: dict = Depends(get_current_user)):
     if not file.filename:
         raise HTTPException(400, "Nom de fichier manquant")
     fname = file.filename.lower()
     if not any(fname.endswith(f) for f in SUPPORTED_FORMATS):
         raise HTTPException(400, "Format non supporté. Acceptés: WAV, MP3, FLAC, AIFF, OGG")
+    tier = current_user.get("tier", "free")
+    if current_user.get("analyses_used", 0) >= TIER_LIMITS.get(tier, 2):
+        raise HTTPException(403, f"Quota mensuel atteint ({TIER_LIMITS[tier]} analyses/{tier}). Passez au tier supérieur.")
     try:
         content = await file.read()
+        if len(content) > MAX_FILE_SIZE:
+            raise HTTPException(413, "Fichier trop volumineux (max 100 MB)")
+        kind = filetype.guess(content)
+        if not kind or kind.mime.split('/')[0] != 'audio':
+            raise HTTPException(400, "Type de fichier invalide (format audio requis)")
         with tempfile.NamedTemporaryFile(suffix=Path(fname).suffix, delete=False) as tmp:
             tmp.write(content)
             tmp_path = tmp.name
         try:
             result = await asyncio.wait_for(
-                _run_pipeline(tmp_path, file.filename),
+                _run_pipeline(tmp_path, file.filename, tier=tier),
                 timeout=ANALYZE_TIMEOUT
+            )
+            await db.audio_analyses.update_one(
+                {"id": result.id}, {"$set": {"user_id": current_user["user_id"]}}
+            )
+            await db.users.update_one(
+                {"user_id": current_user["user_id"]}, {"$inc": {"analyses_used": 1}}
             )
             return result
         except asyncio.TimeoutError:
@@ -354,23 +486,24 @@ async def analyze_audio(file: UploadFile = File(...)):
 
 
 @api_router.post("/analyze-stream")
-async def analyze_stream(file: UploadFile = File(...)):
-    """
-    SSE streaming version of /analyze.
-    Sends progress events as 'data: {...}\\n\\n' then the full result as the last event.
-
-    Frontend usage (replaces axios POST):
-        const res = await fetch(`${API}/analyze-stream`, { method: 'POST', body: formData });
-        const reader = res.body.getReader();
-        // parse SSE lines, update progress bar, parse final 'result' event
-    """
+@limiter.limit("5/minute")
+async def analyze_stream(request: Request, file: UploadFile = File(...),
+                          current_user: dict = Depends(get_current_user)):
     if not file.filename:
         raise HTTPException(400, "Nom de fichier manquant")
     fname = file.filename.lower()
     if not any(fname.endswith(f) for f in SUPPORTED_FORMATS):
         raise HTTPException(400, "Format non supporté. Acceptés: WAV, MP3, FLAC, AIFF, OGG")
+    tier = current_user.get("tier", "free")
+    if current_user.get("analyses_used", 0) >= TIER_LIMITS.get(tier, 2):
+        raise HTTPException(403, "Quota mensuel atteint. Passez au tier supérieur.")
 
     content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(413, "Fichier trop volumineux (max 100 MB)")
+    kind = filetype.guess(content)
+    if not kind or kind.mime.split('/')[0] != 'audio':
+        raise HTTPException(400, "Type de fichier invalide")
     filename = file.filename
 
     async def generate():
@@ -406,7 +539,7 @@ async def analyze_stream(file: UploadFile = File(...)):
             score = calculate_score(freq, loudness, stereo)
 
             yield evt("recommendations", 85, "Recommandations IA…")
-            recs = await get_recommendations(freq, loudness, stereo, filename)
+            recs = await get_recommendations(freq, loudness, stereo, filename, tier=tier)
 
             aid = str(uuid.uuid4())
             result = AnalysisResult(
@@ -419,7 +552,11 @@ async def analyze_stream(file: UploadFile = File(...)):
             result_dict = result.model_dump()
             result_dict['created_at'] = datetime.now(timezone.utc).isoformat()
             try:
+                result_dict['user_id'] = current_user["user_id"]
                 await db.audio_analyses.insert_one(dict(result_dict))
+                await db.users.update_one(
+                    {"user_id": current_user["user_id"]}, {"$inc": {"analyses_used": 1}}
+                )
             except Exception as db_err:
                 logger.error(f"[analyze-stream] DB insert failed (non-fatal): {db_err}")
 
@@ -438,15 +575,19 @@ async def analyze_stream(file: UploadFile = File(...)):
     )
 
 @api_router.get("/analyses", response_model=List[AnalysisResult])
-async def get_analyses():
+async def get_analyses(current_user: dict = Depends(get_current_user)):
     try:
-        return await db.audio_analyses.find({}, {"_id": 0}).to_list(100)
+        return await db.audio_analyses.find(
+            {"user_id": current_user["user_id"]}, {"_id": 0}
+        ).sort([("created_at", -1)]).to_list(50)
     except Exception as e:
         logger.error(f"get_analyses error: {e}")
         raise HTTPException(500, "Erreur lors de la récupération des analyses")
 
 @api_router.post("/chat", response_model=ChatResponse)
-async def chat_with_ai(chat: ChatMessage):
+@limiter.limit("20/minute")
+async def chat_with_ai(request: Request, chat: ChatMessage,
+                        current_user: dict = Depends(get_current_user)):
     try:
         system = """Tu es un ingénieur du son professionnel avec 20 ans d'expérience.
 Tu réponds aux questions sur production musicale, mixage, mastering, acoustique, équipements.
@@ -463,7 +604,7 @@ Précis, technique mais accessible. En français. Hors sujet → redirige polime
 
         def _call():
             return anthropic_client.messages.create(
-                model="claude-sonnet-4-20250514", max_tokens=1024,
+                model="claude-haiku-4-5-20251001", max_tokens=1024,
                 system=system, messages=messages
             )
         msg = await asyncio.to_thread(_call)
@@ -479,9 +620,11 @@ Précis, technique mais accessible. En français. Hors sujet → redirige polime
         raise HTTPException(500, f"Erreur chat: {str(e)}")
 
 @api_router.get("/export-pdf/{analysis_id}")
-async def export_pdf(analysis_id: str):
+async def export_pdf(analysis_id: str, current_user: dict = Depends(get_current_user)):
     try:
-        analysis = await db.audio_analyses.find_one({"id": analysis_id}, {"_id": 0})
+        analysis = await db.audio_analyses.find_one(
+            {"id": analysis_id, "user_id": current_user["user_id"]}, {"_id": 0}
+        )
     except Exception as e:
         logger.error(f"export_pdf DB error: {e}")
         raise HTTPException(500, "Erreur base de données")
@@ -554,8 +697,11 @@ async def export_pdf(analysis_id: str):
         headers={"Content-Disposition": f"attachment; filename=SoundMaster_{fname_safe}.pdf"})
 
 app.include_router(api_router)
-app.add_middleware(CORSMiddleware, allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS','*').split(','), allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware,
+    allow_origins=[os.environ.get('FRONTEND_URL', 'http://localhost:5173')],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"])
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
